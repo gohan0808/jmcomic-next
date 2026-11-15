@@ -1,0 +1,83 @@
+name: Release Signed APK
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 配置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 编译 Release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --console=plain
+
+      - name: 使用正式证书重新签名并对齐 APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          # 查找编译生成的 APK（兼容项目自定义输出文件名 jm-mobile_v{versionName}_{gitHash}.apk）
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          echo "Found APK: $APK_PATH"
+
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "检测到签名配置，开始正式签名..."
+            echo "$KEYSTORE_BASE64" | base64 --decode > release.keystore
+
+            BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+            ALIGNED_APK="${APK_PATH%.apk}-aligned.apk"
+            SIGNED_APK="${APK_PATH%.apk}-signed.apk"
+
+            "$BUILD_TOOLS_DIR/zipalign" -v -p 4 "$APK_PATH" "$ALIGNED_APK"
+            "$BUILD_TOOLS_DIR/apksigner" sign \
+              --ks release.keystore \
+              --ks-pass pass:"$KEYSTORE_PASSWORD" \
+              --ks-key-alias "$KEY_ALIAS" \
+              --key-pass pass:"$KEY_PASSWORD" \
+              --out "$SIGNED_APK" \
+              "$ALIGNED_APK"
+
+            mv "$SIGNED_APK" "$APK_PATH"
+            rm -f "$ALIGNED_APK" release.keystore
+          else
+            echo "未配置 KEYSTORE_BASE64，保留项目默认的 debug 签名产物。"
+          fi
+          echo "FINAL_APK=$APK_PATH" >> $GITHUB_ENV
+
+      - name: 上传至 Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmcomic-next-release
+          path: ${{ env.FINAL_APK }}
+
+      - name: 创建 GitHub Release (仅在推送 Tag 时触发)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.FINAL_APK }}
+          draft: false
+          generate_release_notes: true
